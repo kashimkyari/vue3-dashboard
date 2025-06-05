@@ -8,9 +8,8 @@
         <h3>{{ stream.streamer_username }}</h3>
         <div class="stream-tags">
           <span class="tag platform">{{ stream.platform }}</span>
-          <!-- Updated agent tags to properly display usernames -->
           <div class="agent-tags">
-            <span v-if="!hasAssignments" class="tag agent unassigned">
+            <span v-if="!hasAssignedAgents" class="tag agent unassigned">
               Unassigned
             </span>
             <span 
@@ -19,7 +18,7 @@
               class="tag agent"
               v-tooltip="'Agent ID: ' + assignment.agent_id"
             >
-              {{ getAgentUsername(assignment) }}
+              {{ assignedAgentNames[assignment.agent_id] || 'Agent ' + assignment.agent_id }}
             </span>
           </div>
           <span class="tag stream-id">ID: {{ stream.id }}</span>
@@ -31,6 +30,21 @@
           <div v-if="isLoading" class="loading-overlay">
             <font-awesome-icon icon="spinner" spin class="loading-icon" />
             <div>Loading stream...</div>
+          </div>
+          <div class="detection-controls">
+            <button class="detection-toggle" :class="{
+              'active': isDetecting,
+              'loading': isDetectionLoading,
+              'error': detectionError
+            }" @click="toggleDetection" :title="getDetectionButtonTooltip"
+              :disabled="!isOnline || isDetectionLoading">
+              <span class="detection-icon">
+                <font-awesome-icon v-if="isDetectionLoading" icon="spinner" spin />
+                <font-awesome-icon v-else-if="detectionError" icon="exclamation-circle" />
+                <font-awesome-icon v-else :icon="isDetecting ? 'stop-circle' : 'play-circle'" />
+              </span>
+              <span class="detection-label">{{ getDetectionButtonText }}</span>
+            </button>
           </div>
         </div>
         <div v-if="detections.length > 0" class="detections-section">
@@ -58,72 +72,7 @@
         </div>
       </div>
       <div class="modal-footer">
-        <button 
-          @click="openAssignAgentModal" 
-          class="action-button" 
-          v-wave
-          :disabled="isRefreshing"
-        >
-          Assign Agent
-        </button>
-        <button 
-          @click="handleRefresh" 
-          class="action-button" 
-          v-wave
-          :disabled="isRefreshing"
-        >
-          <span v-if="isRefreshing">
-            <font-awesome-icon icon="spinner" spin />
-            Refreshing...
-          </span>
-          <span v-else>
-            Refresh Stream
-          </span>
-        </button>
-      </div>
-    </div>
-  </div>
-  <!-- Assign Agent Modal -->
-  <div v-if="showAssignModal" class="modal-overlay" @click.self="closeAssignAgentModal">
-    <div class="assign-modal-content">
-      <button class="modal-close" @click="closeAssignAgentModal" v-wave>
-        <font-awesome-icon icon="times" />
-      </button>
-      <div class="modal-header">
-        <h3>Assign Agent to {{ stream.streamer_username }}</h3>
-      </div>
-      <div class="modal-body">
-        <div class="agent-selection">
-          <label for="agentSelect">Select Agent:</label>
-          <select id="agentSelect" v-model="selectedAgentId" class="agent-select">
-            <option value="">-- Select an Agent --</option>
-            <option v-for="agent in agents" :key="agent.id" :value="agent.id">
-              {{ agent.username }} (ID: {{ agent.id }})
-            </option>
-          </select>
-        </div>
-        <div v-if="assignmentError" class="error-banner">
-          {{ assignmentError }}
-        </div>
-      </div>
-      <div class="modal-footer">
-        <button @click="closeAssignAgentModal" class="action-button cancel" v-wave>
-          Cancel
-        </button>
-        <button 
-          @click="assignAgent" 
-          class="action-button confirm" 
-          v-wave
-          :disabled="!selectedAgentId || isAssigning"
-        >
-          <span v-if="isAssigning">
-            <font-awesome-icon icon="spinner" spin />
-            Assigning...
-          </span>
-          <span v-else>
-            Assign Agent
-          </span>
-        </button>
+        <!-- Removed assign agent and refresh buttons -->
       </div>
     </div>
   </div>
@@ -132,7 +81,7 @@
 <script>
 import Hls from 'hls.js'
 import anime from 'animejs'
-import { ref, onMounted, onBeforeUnmount, watch, computed } from 'vue'
+import { ref, onMounted, onBeforeUnmount, watch, computed, inject } from 'vue'
 import axios from 'axios'
 
 export default {
@@ -153,46 +102,84 @@ export default {
     show: {
       type: Boolean,
       default: false
-    },
-    agents: {
-      type: Array,
-      default: () => []
     }
   },
-  emits: ['close', 'assign', 'refresh', 'agent-assigned'],
+  emits: ['close', 'detection-toggled', 'stream-updated'],
   setup(props, { emit }) {
     const refreshError = ref(null)
     const videoPlayer = ref(null)
     const hls = ref(null)
     const isLoading = ref(true)
-    const showAssignModal = ref(false)
-    const selectedAgentId = ref('')
-    const assignmentError = ref(null)
-    const isAssigning = ref(false)
+    const isDetecting = ref(props.stream.is_monitored)
+    const isDetectionLoading = ref(false)
+    const detectionError = ref(null)
+    const isOnline = ref(props.stream.status === 'online' || props.stream.status === 'monitoring')
+    const toast = inject('toast', null)
     const agentCache = ref({})
+    const allAgentsFetched = ref(false)
     
-    // Computed property to check if there are any assigned agents
-    const hasAssignments = computed(() => {
-      return props.stream.assignments && props.stream.assignments.length > 0;
+    const hasAssignedAgents = computed(() => {
+      return props.stream.assignments && props.stream.assignments.length > 0
     })
 
-    // Helper function to get agent username from assignment or fetch from API
-    const getAgentUsername = async (assignment) => {
-      if (assignment.agent && assignment.agent.username) {
-        return assignment.agent.username;
-      }
-      const agentId = assignment.agent_id;
-      if (agentCache.value[agentId]) {
-        return agentCache.value[agentId];
-      }
+    const assignedAgentNames = computed(() => {
+      if (!hasAssignedAgents.value) return {}
+      const names = {}
+      props.stream.assignments.forEach(assignment => {
+        if (assignment.agent && assignment.agent.username) {
+          names[assignment.agent_id] = assignment.agent.username
+        } else {
+          const agentId = assignment.agent_id
+          names[agentId] = agentCache.value[agentId] || `Agent ${agentId}`
+        }
+      })
+      return names
+    })
+
+    const getDetectionButtonText = computed(() => {
+      if (isDetectionLoading.value) return 'Loading...'
+      if (detectionError.value) return 'Error'
+      return isDetecting.value ? 'Stop' : 'Monitor'
+    })
+
+    const getDetectionButtonTooltip = computed(() => {
+      if (isDetectionLoading.value) return 'Processing detection request...'
+      if (detectionError.value) return `Detection error: ${detectionError.value}`
+      return isDetecting.value ? 'Stop detection' : 'Start detection'
+    })
+
+    const fetchAllAgents = async () => {
+      if (allAgentsFetched.value) return
       try {
-        const response = await axios.get(`/api/agents/${agentId}`);
-        const username = response.data.username || `Agent ${agentId}`;
-        agentCache.value[agentId] = username;
-        return username;
+        const response = await axios.get('/api/agents')
+        const agents = response.data || []
+        agents.forEach(agent => {
+          agentCache.value[agent.id] = agent.username || `Agent ${agent.id}`
+        })
+        allAgentsFetched.value = true
       } catch (error) {
-        console.error(`Error fetching username for agent ${agentId}:`, error);
-        return `Agent ${agentId}`;
+        console.error('Error fetching all agents:', error)
+        fetchAgentUsernames()
+      }
+    }
+
+    const fetchAgentUsernames = async () => {
+      if (!hasAssignedAgents.value) return
+      for (const assignment of props.stream.assignments) {
+        if (assignment.agent && assignment.agent.username) {
+          agentCache.value[assignment.agent_id] = assignment.agent.username
+        } else {
+          const agentId = assignment.agent_id
+          if (!agentCache.value[agentId]) {
+            try {
+              const response = await axios.get(`/api/agents/${agentId}`)
+              agentCache.value[agentId] = response.data.username || `Agent ${agentId}`
+            } catch (error) {
+              console.error(`Error fetching username for agent ${agentId}:`, error)
+              agentCache.value[agentId] = `Agent ${agentId}`
+            }
+          }
+        }
       }
     }
 
@@ -207,49 +194,12 @@ export default {
       })
     }
 
-    const handleRefresh = () => {
-      refreshError.value = null
-      isLoading.value = true
-      destroyHls()
-      emit('refresh')
-      // Re-initialize the video player after a short delay
-      setTimeout(() => {
-        initializeVideo()
-      }, 1000)
-      // Call platform-specific refresh endpoint
-      refreshStream();
-    }
-
-    const refreshStream = async () => {
-      try {
-        let response;
-        if (props.stream.platform.toLowerCase() === 'chaturbate') {
-          response = await axios.post('/api/streams/refresh/chaturbate', {
-            room_slug: props.stream.streamer_username
-          });
-        } else if (props.stream.platform.toLowerCase() === 'stripchat') {
-          response = await axios.post('/api/streams/refresh/stripchat', {
-            room_url: props.stream.room_url
-          });
-        }
-        if (response?.data) {
-          emit('refresh');
-          // Show success toast or notification if needed
-          console.log(`Stream ${props.stream.streamer_username} refreshed successfully.`);
-        }
-      } catch (error) {
-        console.error('Error refreshing stream:', error);
-        refreshError.value = `Could not refresh ${props.stream.streamer_username}. Please try again.`;
-      }
-    };
-
     const initializeVideo = () => {
       if (!videoPlayer.value) return
       
       try {
         isLoading.value = true
         
-        // Get the correct m3u8 URL directly from the stream object
         let m3u8Url = null
         
         if (props.stream.platform.toLowerCase() === 'chaturbate' && props.stream.chaturbate_m3u8_url) {
@@ -264,9 +214,8 @@ export default {
           return
         }
         
-        // Initialize HLS.js if supported
         if (Hls.isSupported()) {
-          destroyHls() // Clean up any existing instance
+          destroyHls()
           
           hls.value = new Hls({
             startLevel: 0,
@@ -279,13 +228,12 @@ export default {
           hls.value.attachMedia(videoPlayer.value)
           
           hls.value.on(Hls.Events.MANIFEST_PARSED, () => {
-            videoPlayer.value.muted = true // Muted for autoplay
+            videoPlayer.value.muted = true
             videoPlayer.value.play().catch(e => {
               console.warn('Autoplay prevented:', e)
             })
             isLoading.value = false
             
-            // Add animation for the video player
             anime({
               targets: videoPlayer.value,
               opacity: [0, 1],
@@ -314,11 +262,10 @@ export default {
             }
           })
         } 
-        // Fallback for browsers with native HLS support
         else if (videoPlayer.value.canPlayType('application/vnd.apple.mpegurl')) {
           videoPlayer.value.src = m3u8Url
           videoPlayer.value.addEventListener('loadedmetadata', () => {
-            videoPlayer.value.muted = true // Muted for autoplay
+            videoPlayer.value.muted = true
             videoPlayer.value.play().catch(e => {
               console.warn('Autoplay prevented:', e)
             })
@@ -352,60 +299,65 @@ export default {
         videoPlayer.value.load()
       }
     }
-    
-    // Assign Agent Modal functions
-    const openAssignAgentModal = () => {
-      showAssignModal.value = true
-      selectedAgentId.value = ''
-      assignmentError.value = null
-      // Add animation for modal entrance
-      anime({
-        targets: '.assign-modal-content',
-        translateY: [30, 0],
-        opacity: [0, 1],
-        easing: 'easeOutExpo',
-        duration: 600
-      })
-    }
-    
-    const closeAssignAgentModal = () => {
-      showAssignModal.value = false
-      selectedAgentId.value = ''
-      assignmentError.value = null
-    }
-    
-    const assignAgent = async () => {
-      if (!selectedAgentId.value) return
-      
-      isAssigning.value = true
-      assignmentError.value = null
-      
+
+    const checkDetectionStatus = async () => {
       try {
-        const response = await axios.post('/api/assignments', {
-          stream_id: props.stream.id,
-          agent_id: selectedAgentId.value
-        })
-        
-        if (response.data) {
-          emit('agent-assigned', {
-            streamId: props.stream.id,
-            assignment: response.data
-          })
-          closeAssignAgentModal()
-          // Show success toast or notification if needed
-          console.log(`Agent ${selectedAgentId.value} assigned to stream ${props.stream.id}`)
+        const response = await axios.get(`/api/detection-status/${props.stream.id}`)
+        isDetecting.value = response.data.isDetecting
+        isDetectionLoading.value = response.data.isDetectionLoading
+        detectionError.value = response.data.detectionError
+        isOnline.value = response.data.status === 'online' || response.data.status === 'monitoring'
+      } catch (error) {
+        console.error('Error checking detection status:', error)
+        detectionError.value = error.response?.data?.error || error.message
+      }
+    }
+
+    const toggleDetection = async () => {
+      if (isDetectionLoading.value) return
+
+      try {
+        const statusResponse = await axios.get(`/api/detection-status/${props.stream.id}`)
+        if (statusResponse.data.isDetecting === isDetecting.value) {
+          isDetectionLoading.value = true
+          detectionError.value = null
+          try {
+            const response = await axios.post('/api/trigger-detection', {
+              stream_id: props.stream.id,
+              stop: isDetecting.value
+            })
+
+            isDetecting.value = response.data.isDetecting
+            isDetectionLoading.value = response.data.isDetectionLoading
+            detectionError.value = response.data.detectionError
+
+            toast.success(
+              isDetecting.value
+                ? `Detection started for ${props.stream.streamer_username}`
+                : `Detection stopped for ${props.stream.streamer_username}`
+            )
+            emit('detection-toggled', { streamId: props.stream.id, isDetecting: isDetecting.value })
+          } catch (error) {
+            console.error('Error toggling detection:', error)
+            detectionError.value = error.response?.data?.error || error.message
+            toast.error(`Error toggling detection: ${detectionError.value}`)
+          } finally {
+            isDetectionLoading.value = false
+          }
+        } else {
+          isDetecting.value = statusResponse.data.isDetecting
+          isDetectionLoading.value = statusResponse.data.isDetectionLoading
+          detectionError.value = statusResponse.data.detectionError
+          toast.info(`Detection state updated for ${props.stream.streamer_username}`)
         }
       } catch (error) {
-        console.error('Error assigning agent:', error)
-        assignmentError.value = 'Failed to assign agent. Please try again.'
-      } finally {
-        isAssigning.value = false
+        console.error('Error checking detection status before toggle:', error)
+        detectionError.value = error.response?.data?.error || error.message
+        toast.error(`Error checking detection status: ${detectionError.value}`)
       }
     }
     
-    // Initialize when mounted
     onMounted(() => {
-      // Add entrance animation to modal
       anime({
         targets: '.modal-content',
         translateY: [30, 0],
@@ -415,8 +367,9 @@ export default {
       })
       
       initializeVideo()
+      fetchAllAgents()
+      checkDetectionStatus()
       
-      // Add animation to detection cards
       anime({
         targets: '.detection-card',
         scale: [0.9, 1],
@@ -427,32 +380,43 @@ export default {
       })
     })
     
-    // Clean up when unmounting
     onBeforeUnmount(() => {
       destroyHls()
     })
     
-    // Watch for stream changes and reinitialize video
     watch(() => props.stream.id, () => {
       destroyHls()
       initializeVideo()
     })
 
+    watch(() => props.stream.status, (newStatus) => {
+      isOnline.value = newStatus === 'online' || newStatus === 'monitoring'
+    })
+
+    watch(() => props.stream.is_monitored, (newMonitored) => {
+      isDetecting.value = newMonitored
+    })
+
+    watch(() => props.stream.assignments, () => {
+      if (!allAgentsFetched.value) {
+        fetchAllAgents()
+      }
+    }, { deep: true })
+
     return {
-      formatTime,
-      handleRefresh,
       refreshError,
       videoPlayer,
       isLoading,
-      hasAssignments,
-      getAgentUsername,
-      openAssignAgentModal,
-      closeAssignAgentModal,
-      assignAgent,
-      showAssignModal,
-      selectedAgentId,
-      assignmentError,
-      isAssigning
+      hasAssignedAgents,
+      assignedAgentNames,
+      formatTime,
+      isDetecting,
+      isDetectionLoading,
+      detectionError,
+      isOnline,
+      toggleDetection,
+      getDetectionButtonText,
+      getDetectionButtonTooltip
     }
   }
 }
@@ -481,17 +445,6 @@ export default {
   width: 100%;
   max-width: 800px;
   max-height: 85vh;
-  overflow-y: auto;
-  box-shadow: 0 10px 25px rgba(0, 0, 0, 0.2);
-  position: relative;
-}
-
-.assign-modal-content {
-  background-color: var(--input-bg);
-  border-radius: 10px;
-  width: 100%;
-  max-width: 500px;
-  max-height: 60vh;
   overflow-y: auto;
   box-shadow: 0 10px 25px rgba(0, 0, 0, 0.2);
   position: relative;
@@ -610,6 +563,56 @@ export default {
   animation: spin 1s linear infinite;
 }
 
+.detection-controls {
+  position: absolute;
+  top: 10px;
+  right: 10px;
+  z-index: 10;
+}
+
+.detection-toggle {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  background-color: rgba(40, 167, 69, 0.85);
+  color: white;
+  border: none;
+  border-radius: 20px;
+  padding: 6px 12px;
+  font-size: 0.8rem;
+  cursor: pointer;
+  transition: all 0.2s ease;
+}
+
+.detection-toggle:hover:not(:disabled) {
+  background-color: rgb(103, 124, 108);
+  transform: translateY(-2px);
+}
+
+.detection-toggle.active {
+  background-color: rgba(220, 53, 69, 0.85);
+}
+
+.detection-toggle.active:hover:not(:disabled) {
+  background-color: rgba(200, 33, 49, 0.85);
+  transform: translateY(-2px);
+}
+
+.detection-toggle.loading {
+  background-color: rgba(255, 193, 7, 0.85);
+  pointer-events: none;
+}
+
+.detection-toggle.error {
+  background-color: rgba(220, 53, 69, 0.85);
+  animation: shake 0.3s;
+}
+
+.detection-toggle:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
 .detections-section h4 {
   margin: 20px 0 15px 0;
   font-size: 1.2rem;
@@ -674,81 +677,6 @@ export default {
   gap: 10px;
 }
 
-.action-button {
-  background-color: var(--primary-color);
-  color: white;
-  border: none;
-  padding: 8px 15px;
-  border-radius: 5px;
-  cursor: pointer;
-  transition: all 0.2s ease;
-  font-size: 0.9rem;
-  display: flex;
-  align-items: center;
-  gap: 8px;
-}
-
-.action-button:hover:not(:disabled) {
-  opacity: 0.9;
-  transform: translateY(-1px);
-}
-
-.action-button:active:not(:disabled) {
-  transform: translateY(1px);
-}
-
-.action-button:disabled {
-  opacity: 0.7;
-  cursor: not-allowed;
-  background-color: var(--disabled-bg);
-}
-
-.action-button.cancel {
-  background-color: var(--hover-bg);
-  color: var(--text-color);
-}
-
-.action-button.cancel:hover:not(:disabled) {
-  background-color: var(--disabled-bg);
-}
-
-.action-button.confirm {
-  background-color: var(--primary-color);
-  color: white;
-}
-
-.action-button.confirm:hover:not(:disabled) {
-  background-color: var(--primary-hover);
-}
-
-.agent-selection {
-  margin-bottom: 20px;
-}
-
-.agent-selection label {
-  display: block;
-  margin-bottom: 8px;
-  font-weight: 500;
-  color: var(--text-secondary);
-}
-
-.agent-select {
-  width: 100%;
-  padding: 10px;
-  border: 1px solid var(--input-border);
-  border-radius: 5px;
-  background-color: var(--input-bg);
-  color: var(--text-color);
-  font-size: 0.9rem;
-  transition: all 0.2s ease;
-}
-
-.agent-select:focus {
-  outline: none;
-  border-color: var(--primary-color);
-  box-shadow: 0 0 0 2px rgba(var(--primary-rgb), 0.2);
-}
-
 .error-banner {
   background-color: #ffebee;
   color: #b71c1c;
@@ -769,6 +697,14 @@ export default {
   to { transform: rotate(360deg); }
 }
 
+@keyframes shake {
+  0% { transform: translateX(0); }
+  25% { transform: translateX(-2px); }
+  50% { transform: translateX(2px); }
+  75% { transform: translateX(-2px); }
+  100% { transform: translateX(0); }
+}
+
 @media (max-width: 576px) {
   .modal-content {
     max-height: 85vh;
@@ -780,11 +716,6 @@ export default {
   
   .modal-footer {
     flex-direction: column;
-  }
-  
-  .action-button {
-    width: 100%;
-    justify-content: center;
   }
   
   .detections-grid {
