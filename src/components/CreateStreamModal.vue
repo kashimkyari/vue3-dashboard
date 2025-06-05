@@ -84,7 +84,7 @@
           </div>
 
           <!-- Assignment Notes -->
-          <div class="form-group" v-show="!isCreating">
+          <!-- <div class="form-group" v-show="!isCreating">
             <label for="notes">
               <font-awesome-icon icon="sticky-note" class="field-icon" />
               Assignment Notes (Optional)
@@ -98,7 +98,7 @@
             <div class="form-hint">
               {{ form.notes ? form.notes.length : 0 }}/500 characters
             </div>
-          </div>
+          </div> -->
 
           <!-- Priority Selection -->
           <div class="form-group" v-show="!isCreating">
